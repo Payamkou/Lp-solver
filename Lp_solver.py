@@ -90,22 +90,6 @@ class TwoPhaseSimplex:
 
         # -------------------------------------------------------
         # BUG FIX 1: Negative RHS handling
-        #
-        # A negative RHS means the initial basis row (slack or
-        # artificial at 1) would have a negative value, violating
-        # the non-negativity requirement and breaking Phase I.
-        #
-        # Fix: normalize all constraints BEFORE counting columns.
-        # Multiply the entire constraint row by -1 and flip the
-        # inequality sense so that the RHS becomes positive:
-        #   x <= -1  =>  -x >= 1
-        #   x >= -1  =>  -x <= 1
-        #   x  = -1  =>  -x  = 1  (sign flip, sense unchanged)
-        #
-        # This must happen before counting slack/artificial columns
-        # because the flip can change "<=" into ">=" (adding an
-        # artificial that wasn't budgeted for), causing an
-        # out-of-bounds write into the tableau array.
         # -------------------------------------------------------
         normalized = []
         for coeffs, sense, rhs in self.constraints:
@@ -206,7 +190,7 @@ class TwoPhaseSimplex:
         while True:
             iteration += 1
             costs = self.tableau[-1, :-1]
-            # Bland's rule: pick the lowest-index positive reduced cost
+            # Bland's rule
             entering = next((j for j in range(len(costs)) if costs[j] > EPS), -1)
             if entering == -1:
                 return
@@ -246,14 +230,6 @@ class TwoPhaseSimplex:
 
         # -------------------------------------------------------
         # BUG FIX 2: None entries in basis (degenerate Phase I)
-        #
-        # When an artificial variable stays in the basis at value 0
-        # (degenerate case), its entry in self.basis is set to None
-        # after the column-removal remapping. Using None as a numpy
-        # column index silently selects the LAST column (the RHS),
-        # corrupting the entire objective row canonicalization.
-        #
-        # Fix: skip any basis entry that is None.
         # -------------------------------------------------------
         for i, col in enumerate(self.basis):
             if col is None:
