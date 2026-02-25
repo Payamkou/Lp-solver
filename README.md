@@ -47,10 +47,10 @@ subject to:
 
 4️⃣ **Number of constraints:** `2`
 
-5️⃣ **First constraint:** `1 1 4` (x1 + x2 = 4)
+5️⃣ **First constraint:** `1 1 4` (x1 + x2 <= 4)
    - Type: `<=`
 
-6️⃣ **Second constraint:** `2 1 7` (2*x1 + x2 = 7)
+6️⃣ **Second constraint:** `2 1 7` (2*x1 + x2 <= 7)
    - Type: `<=`
 
 7️⃣ **Variable types:**
