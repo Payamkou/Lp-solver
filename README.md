@@ -47,10 +47,10 @@ subject to:
 
 4️⃣ **Number of constraints:** `2`
 
-5️⃣ **First constraint:** `1 1 4` (x1 + x2 <= 4)
+5️⃣ **First constraint:** `1 1 4` (x1 + x2 = 4)
    - Type: `<=`
 
-6️⃣ **Second constraint:** `2 1 7` (2*x1 + x2 <= 7)
+6️⃣ **Second constraint:** `2 1 7` (2*x1 + x2 = 7)
    - Type: `<=`
 
 7️⃣ **Variable types:**
@@ -99,6 +99,32 @@ Type (<= / >= / =): <=
 - `2` = Negative or zero (`x <= 0`)
 - `3` = Free (unrestricted)
 
+---
+
+## More Examples
+
+### Example 2: Free Variables
+````
+minimize:    x1 + 2*x2
+subject to:
+             x1 + x2 = 3
+             2*x1 - x2 >= 1
+             x1 >= 0, x2 free
+````
+
+**Input:**
+````
+Number of decision variables: 2
+Enter 2 objective coefficients: 1 2
+Maximization problem? (yes/no): no
+Number of constraints: 2
+Constraint 1 (coefficients + RHS): 1 1 3
+Type (<= / >= / =): =
+Constraint 2 (coefficients + RHS): 2 -1 1
+Type (<= / >= / =): >=
+Variable types:
+x1: 1
+x2: 3
 ````
 
 ### Example 3: Negative RHS Handling
