@@ -33,7 +33,7 @@ Suppose you want to solve:
 maximize:    3*x1 + 2*x2
 subject to:
              x1 + x2 <= 4
-             2*x1 + x2 <= 7
+             2*x1 + x2 = 7
              x1, x2 >= 0
 ````
 
@@ -47,7 +47,7 @@ subject to:
 
 4️⃣ **Number of constraints:** `2`
 
-5️⃣ **First constraint:** `1 1 4` (x1 + x2 = 4)
+5️⃣ **First constraint:** `1 1 4` (x1 + x2 <= 4)
    - Type: `<=`
 
 6️⃣ **Second constraint:** `2 1 7` (2*x1 + x2 = 7)
