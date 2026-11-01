@@ -1,6 +1,11 @@
+import argparse
+
 import numpy as np
 
-EPS = 1e-9
+EPS = 1e-9               # pivot / reduced-cost tolerance
+FEAS_TOL = 1e-7          # feasibility tolerance (relative to the largest |RHS|)
+DEGENERATE_LIMIT = 50    # consecutive degenerate pivots before switching to Bland's rule
+MAX_ITER = 100_000       # safety net against numerical stalling
 
 
 def safe_int(prompt):
@@ -23,6 +28,19 @@ def safe_float_list(prompt, expected_len):
             print("Enter numeric values separated by space.")
 
 
+def safe_choice(prompt, choices):
+    while True:
+        ans = input(prompt).strip()
+        if ans in choices:
+            return ans
+        print(f"Choose one of: {' / '.join(choices)}")
+
+
+def _clean(v):
+    """Round for display and avoid printing -0.0."""
+    return round(float(v), 6) + 0.0
+
+
 class TwoPhaseSimplex:
     def __init__(self):
         self.n = 0
@@ -34,10 +52,36 @@ class TwoPhaseSimplex:
         self.basis = []
         self.artificial_cols = []
         self.col_map = []
+        self.var_matrix = None   # x = var_matrix @ (decision columns of the tableau)
+        self.n_dec = 0           # number of decision columns in the tableau
+        self.iterations = 0
 
     # ---------------------------
     # Input
     # ---------------------------
+    def load_problem(self, c, constraints, var_types=None, maximize=True):
+        """
+        Set the problem without prompting.
+
+        c           : objective coefficients
+        constraints : list of (coefficients, sense, rhs), sense in "<=", ">=", "="
+        var_types   : 1 = >=0, 2 = <=0, 3 = free  (default: all >=0)
+        """
+        self.n = len(c)
+        self.is_max = maximize
+        self.c = np.asarray(c, dtype=float) * (1.0 if maximize else -1.0)
+        self.constraints = []
+        for coeffs, sense, rhs in constraints:
+            coeffs = np.asarray(coeffs, dtype=float)
+            if coeffs.shape != (self.n,):
+                raise ValueError(f"Constraint needs {self.n} coefficients.")
+            if sense not in ("<=", ">=", "="):
+                raise ValueError("Invalid constraint type.")
+            self.constraints.append((coeffs, sense, float(rhs)))
+        self.var_types = [1] * self.n if var_types is None else list(var_types)
+        if len(self.var_types) != self.n or any(t not in (1, 2, 3) for t in self.var_types):
+            raise ValueError("Variable types must be 1, 2 or 3 (one per variable).")
+
     def read_problem(self):
         self.n = safe_int("Number of decision variables: ")
         self.c = np.array(
@@ -48,15 +92,15 @@ class TwoPhaseSimplex:
         if not self.is_max:
             self.c = -self.c
 
+        self.constraints = []
         m = safe_int("Number of constraints: ")
         print("Allowed types: <=, >=, =")
         for i in range(m):
             row = safe_float_list(f"Constraint {i+1} (coefficients + RHS): ", self.n + 1)
-            sense = input("Type (<= / >= / =): ").strip()
-            if sense not in ["<=", ">=", "="]:
-                raise ValueError("Invalid constraint type.")
+            sense = safe_choice("Type (<= / >= / =): ", ["<=", ">=", "="])
             self.constraints.append((np.array(row[:-1]), sense, row[-1]))
 
+        self.var_types = []
         print("Variable types:")
         print("1 = >=0, 2 = <=0, 3 = free")
         for i in range(self.n):
@@ -71,235 +115,245 @@ class TwoPhaseSimplex:
     # Build Tableau
     # ---------------------------
     def build_tableau(self):
-        self.basis = []
-        self.artificial_cols = []
-        self.col_map = []
+        n, m = self.n, len(self.constraints)
 
-        # Map decision variables
+        # Map decision variables to non-negative tableau columns:
+        #   type 1: x = y      type 2: x = -y      type 3: x = y+ - y-
+        self.col_map = []
         col = 0
         for t in self.var_types:
-            if t in [1, 2]:
-                self.col_map.append([col])
-                col += 1
-            else:  # free variable -> two positive components
-                self.col_map.append([col, col + 1])
-                col += 2
+            width = 2 if t == 3 else 1
+            self.col_map.append(list(range(col, col + width)))
+            col += width
+        self.n_dec = col
+        M = np.zeros((n, self.n_dec))
+        for j, (t, cols) in enumerate(zip(self.var_types, self.col_map)):
+            M[j, cols[0]] = -1.0 if t == 2 else 1.0
+            if t == 3:
+                M[j, cols[1]] = -1.0
+        self.var_matrix = M
 
-        base_vars = col
-        m = len(self.constraints)
+        A = np.array([coeffs for coeffs, _, _ in self.constraints], dtype=float).reshape(m, n)
+        b = np.array([rhs for _, _, rhs in self.constraints], dtype=float)
+        senses = [sense for _, sense, _ in self.constraints]
 
-        # -------------------------------------------------------
-        # BUG FIX 1: Negative RHS handling
-        # -------------------------------------------------------
-        normalized = []
-        for coeffs, sense, rhs in self.constraints:
-            if rhs < -EPS:
-                coeffs = -coeffs
-                rhs = -rhs
+        # Negative RHS: multiply the row by -1 and flip the inequality
+        flip = {"<=": ">=", ">=": "<=", "=": "="}
+        neg = b < 0
+        A[neg] *= -1
+        b[neg] *= -1
+        senses = [flip[s] if f else s for s, f in zip(senses, neg)]
+
+        slack_count = sum(s != "=" for s in senses)
+        artificial_count = sum(s != "<=" for s in senses)
+        total_cols = self.n_dec + slack_count + artificial_count
+
+        T = np.zeros((m + 1, total_cols + 1))
+        T[:m, :self.n_dec] = A @ M
+        T[:m, -1] = b
+
+        self.basis = [0] * m
+        self.artificial_cols = []
+        self.slack_cols = [None] * m   # slack/surplus column of each row
+        slack_ptr = self.n_dec
+        art_ptr = self.n_dec + slack_count
+        for i, sense in enumerate(senses):
+            if sense != "=":
+                T[i, slack_ptr] = 1.0 if sense == "<=" else -1.0
+                self.slack_cols[i] = slack_ptr
                 if sense == "<=":
-                    sense = ">="
-                elif sense == ">=":
-                    sense = "<="
-                # "=" stays "="
-            normalized.append((coeffs, sense, rhs))
-
-        # Count extra columns (on normalized constraints)
-        slack_count = 0
-        artificial_count = 0
-        for _, sense, _ in normalized:
-            if sense == "<=":
-                slack_count += 1
-            elif sense == ">=":
-                slack_count += 1
-                artificial_count += 1
-            else:
-                artificial_count += 1
-
-        total_cols = base_vars + slack_count + artificial_count
-
-        A = np.zeros((m, total_cols))
-        b = np.zeros(m)
-
-        slack_ptr = base_vars
-        art_ptr = base_vars + slack_count
-
-        for i, (coeffs, sense, rhs) in enumerate(normalized):
-
-            # Decision variables
-            for j in range(self.n):
-                cols = self.col_map[j]
-                if self.var_types[j] == 1:
-                    A[i, cols[0]] = coeffs[j]
-                elif self.var_types[j] == 2:
-                    A[i, cols[0]] = -coeffs[j]
-                else:
-                    A[i, cols[0]] = coeffs[j]
-                    A[i, cols[1]] = -coeffs[j]
-
-            # Slack / Artificial
-            if sense == "<=":
-                A[i, slack_ptr] = 1
-                self.basis.append(slack_ptr)
+                    self.basis[i] = slack_ptr
                 slack_ptr += 1
-            elif sense == ">=":
-                A[i, slack_ptr] = -1
-                slack_ptr += 1
-                A[i, art_ptr] = 1
-                self.basis.append(art_ptr)
-                self.artificial_cols.append(art_ptr)
-                art_ptr += 1
-            else:  # equality
-                A[i, art_ptr] = 1
-                self.basis.append(art_ptr)
+            if sense != "<=":
+                T[i, art_ptr] = 1.0
+                self.basis[i] = art_ptr
                 self.artificial_cols.append(art_ptr)
                 art_ptr += 1
 
-            b[i] = rhs
+        # Phase I objective: maximise -(sum of artificials), already in canonical form
+        art_rows = [i for i, col in enumerate(self.basis) if col >= self.n_dec + slack_count]
+        T[-1] = T[art_rows].sum(axis=0)
+        T[-1, self.artificial_cols] = 0.0
 
-        self.tableau = np.hstack([A, b.reshape(-1, 1)])
-
-        # Phase I objective: minimize sum of artificials -> maximize negative sum
-        obj = np.zeros(total_cols)
-        for col in self.artificial_cols:
-            obj[col] = 1
-
-        phase1_row = np.zeros(total_cols + 1)
-        phase1_row[:-1] = -obj
-        self.tableau = np.vstack([self.tableau, phase1_row])
-
-        # Canonical form: remove artificial coefficients from Phase I row
-        for i, col in enumerate(self.basis):
-            if col in self.artificial_cols:
-                self.tableau[-1] += self.tableau[i]
+        self.tableau = T
+        self.rhs_scale = max(1.0, float(np.abs(b).max(initial=0.0)))
 
     # ---------------------------
     # Pivot
     # ---------------------------
     def pivot(self, r, c):
-        self.tableau[r] /= self.tableau[r, c]
-        for i in range(self.tableau.shape[0]):
-            if i != r:
-                self.tableau[i] -= self.tableau[i, c] * self.tableau[r]
+        T = self.tableau
+        T[r] /= T[r, c]
+        col = T[:, c].copy()
+        col[r] = 0.0
+        rows = np.flatnonzero(col)
+        if 2 * rows.size > T.shape[0]:
+            T -= np.outer(col, T[r])            # dense column: update in place
+        else:
+            T[rows] -= np.outer(col[rows], T[r])
+        T[:, c] = 0.0
+        T[r, c] = 1.0
+        self.basis[r] = c
 
     # ---------------------------
     # Simplex Iteration
     # ---------------------------
     def run_simplex(self, print_steps=False):
-        m = len(self.constraints)
-        iteration = 0
-        while True:
-            iteration += 1
-            costs = self.tableau[-1, :-1]
-            # Bland's rule
-            entering = next((j for j in range(len(costs)) if costs[j] > EPS), -1)
-            if entering == -1:
-                return
-            ratios = []
-            for i in range(m):
-                if self.tableau[i, entering] > EPS:
-                    ratios.append(self.tableau[i, -1] / self.tableau[i, entering])
-                else:
-                    ratios.append(np.inf)
-            if all(r == np.inf for r in ratios):
+        """
+        Primal simplex on the current tableau.
+
+        Uses Dantzig's rule (largest reduced cost) for speed and falls back to
+        Bland's rule after DEGENERATE_LIMIT consecutive degenerate pivots, which
+        rules out cycling.
+        """
+        T = self.tableau
+        m = len(self.basis)
+        degenerate = 0
+        for _ in range(MAX_ITER):
+            costs = T[-1, :-1]
+            bland = degenerate >= DEGENERATE_LIMIT
+            if bland:
+                candidates = np.flatnonzero(costs > EPS)
+                if candidates.size == 0:
+                    return
+                entering = int(candidates[0])
+            else:
+                entering = int(np.argmax(costs))
+                if costs[entering] <= EPS:
+                    return
+
+            column = T[:m, entering]
+            rows = np.flatnonzero(column > EPS)
+            if rows.size == 0:
                 raise ValueError("UNBOUNDED problem.")
-            leaving = np.argmin(ratios)
+            ratios = np.maximum(T[rows, -1], 0.0) / column[rows]
+            best = ratios.min()
+            ties = rows[ratios <= best + EPS]
+            if bland:
+                leaving = int(min(ties, key=lambda i: self.basis[i]))
+            else:
+                leaving = int(ties[np.argmax(column[ties])])   # most stable pivot
+
+            degenerate = degenerate + 1 if best <= EPS else 0
             self.pivot(leaving, entering)
-            self.basis[leaving] = entering
+            self.iterations += 1
             if print_steps:
-                print(f"\nIteration {iteration}")
+                print(f"\nIteration {self.iterations}")
                 print(np.round(self.tableau, 6))
+        raise RuntimeError("Iteration limit reached (numerical stalling).")
+
+    # ---------------------------
+    # Phase I -> Phase II
+    # ---------------------------
+    def end_phase1(self):
+        """
+        Check feasibility, then remove the artificial variables.
+
+        An artificial that is still basic (at value 0) is pivoted out on any
+        non-zero entry of its row; if the row has none it is redundant and is
+        deleted. Leaving such a row without a basic variable would let Phase II
+        violate the original constraint.
+        """
+        T = self.tableau
+        if T[-1, -1] > FEAS_TOL * self.rhs_scale:
+            raise ValueError("INFEASIBLE problem.")
+
+        is_art = np.zeros(T.shape[1] - 1, dtype=bool)
+        is_art[self.artificial_cols] = True
+        redundant = set()
+        for i, col in enumerate(self.basis):
+            if not is_art[col]:
+                continue
+            row = np.abs(T[i, :-1])
+            row[is_art] = 0.0
+            j = int(np.argmax(row))
+            if row[j] > FEAS_TOL:
+                T[i, -1] = 0.0       # degenerate pivot keeps every RHS unchanged
+                self.pivot(i, j)
+            else:
+                redundant.add(i)
+
+        keep_rows = [i for i in range(len(self.basis)) if i not in redundant]
+        keep_cols = np.flatnonzero(~is_art)
+        new_index = np.full(is_art.size, -1)
+        new_index[keep_cols] = np.arange(keep_cols.size)
+        self.tableau = T[np.ix_(keep_rows + [T.shape[0] - 1],
+                                np.append(keep_cols, T.shape[1] - 1))]
+        self.basis = [int(new_index[self.basis[i]]) for i in keep_rows]
+        self.slack_cols = [None if self.slack_cols[i] is None else int(new_index[self.slack_cols[i]])
+                           for i in keep_rows]
+        self.artificial_cols = []
 
     # ---------------------------
     # Phase II Objective
     # ---------------------------
     def build_phase2_objective(self):
-        cols = self.tableau.shape[1] - 1
-        obj = np.zeros(cols)
-        for j in range(self.n):
-            mapped = self.col_map[j]
-            if self.var_types[j] == 1:
-                obj[mapped[0]] = self.c[j]
-            elif self.var_types[j] == 2:
-                obj[mapped[0]] = -self.c[j]
-            else:
-                obj[mapped[0]] = self.c[j]
-                obj[mapped[1]] = -self.c[j]
-        new_row = np.zeros(cols + 1)
-        new_row[:-1] = obj
-        self.tableau[-1] = new_row
+        T = self.tableau
+        obj = np.zeros(T.shape[1])
+        obj[:self.n_dec] = self.c @ self.var_matrix
+        # Canonical form: zero the reduced costs of the basic variables
+        obj -= obj[self.basis] @ T[:-1]
+        T[-1] = obj
 
-        # -------------------------------------------------------
-        # BUG FIX 2: None entries in basis (degenerate Phase I)
-        # -------------------------------------------------------
-        for i, col in enumerate(self.basis):
-            if col is None:
-                continue  # artificial degenerate: no contribution to obj row
-            coeff = self.tableau[-1, col]
-            if abs(coeff) > EPS:
-                self.tableau[-1] -= coeff * self.tableau[i]
+    # ---------------------------
+    # Solution
+    # ---------------------------
+    def extract_solution(self):
+        T = self.tableau
+        values = np.zeros(T.shape[1] - 1)
+        values[self.basis] = T[:-1, -1]
+        solution = self.var_matrix @ values[:self.n_dec]
+        obj_val = float(self.c @ solution)
+        if not self.is_max:
+            obj_val = -obj_val
+        return solution, obj_val
+
+    def optimize(self, print_steps=False):
+        """Solve the loaded problem; returns (solution, objective value)."""
+        self.iterations = 0
+        self.build_tableau()
+
+        if print_steps:
+            print("\nPhase I...")
+        self.run_simplex(print_steps)
+        self.end_phase1()
+
+        if print_steps:
+            print("\nPhase II...")
+        self.build_phase2_objective()
+        self.run_simplex(print_steps)
+        return self.extract_solution()
 
     # ---------------------------
     # Solve LP
     # ---------------------------
-    def solve(self):
+    def solve(self, print_steps=False):
         self.read_problem()
-        self.build_tableau()
-
-        print("\nPhase I...")
-        self.run_simplex(print_steps=True)
-
-        if abs(self.tableau[-1, -1]) > EPS:
-            raise ValueError("INFEASIBLE problem.")
-
-        # Remove artificial columns
-        keep_cols = [j for j in range(self.tableau.shape[1] - 1)
-                     if j not in self.artificial_cols]
-        self.tableau = self.tableau[:, keep_cols + [-1]]
-
-        # Remap basis indices to post-removal column positions
-        new_basis = []
-        for b in self.basis:
-            if b in keep_cols:
-                new_basis.append(keep_cols.index(b))
-            else:
-                new_basis.append(None)  # artificial stuck in basis at 0
-        self.basis = new_basis
-
-        print("\nPhase II...")
-        self.build_phase2_objective()
-        self.run_simplex(print_steps=True)
-
-        # Extract solution
-        solution = np.zeros(self.n)
-        for i, col in enumerate(self.basis):
-            if col is not None:
-                for j in range(self.n):
-                    if col in self.col_map[j]:
-                        idx = self.col_map[j].index(col)
-                        if self.var_types[j] == 3:
-                            if idx == 0:
-                                solution[j] += self.tableau[i, -1]
-                            else:
-                                solution[j] -= self.tableau[i, -1]
-                        elif self.var_types[j] == 1:
-                            solution[j] = self.tableau[i, -1]
-                        else:
-                            solution[j] = -self.tableau[i, -1]
-
-        obj_val = self.tableau[-1, -1]
-        if self.is_max:
-            obj_val = -obj_val
+        solution, obj_val = self.optimize(print_steps)
 
         print("\nOptimal solution:")
         for i in range(self.n):
-            print(f"x{i+1} = {round(solution[i], 6)}")
-        print("Optimal objective value =", round(obj_val, 6))
+            print(f"x{i+1} = {_clean(solution[i])}")
+        print("Optimal objective value =", _clean(obj_val))
+
+
+def solve_lp(c, constraints, var_types=None, maximize=True):
+    """Convenience wrapper: returns (solution, objective value)."""
+    solver = TwoPhaseSimplex()
+    solver.load_problem(c, constraints, var_types, maximize)
+    return solver.optimize()
 
 
 # ---------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Two-phase simplex LP solver")
+    parser.add_argument("--steps", action="store_true",
+                        help="print the tableau after every pivot")
+    args = parser.parse_args()
     try:
         solver = TwoPhaseSimplex()
-        solver.solve()
-    except Exception as e:
+        solver.solve(print_steps=args.steps)
+    except (ValueError, RuntimeError) as e:
         print("Error:", e)
+    except (EOFError, KeyboardInterrupt):
+        print("\nInput aborted.")
